@@ -10,29 +10,30 @@ from django.shortcuts import render
 class PDFUploadView(APIView):
     parser_classes = (MultiPartParser, FormParser)
 
-    def post(self, request):
+    global filename
+    def upload(self, request):
         serializer = PDF(data=request.data)
         if serializer.is_valid():
-            txt_file = serializer.validated_data['extracted_text']
+            txt_file = serializer.validated_data['extracted_file']
             filename = txt_file.name
 
             # Convert PDF to text
             extracted_text = convertpdf(filename[:-4])  # Remove .pdf extension for the function
             
-            if extracted_text:
-                # Save the extracted text to a .txt file
-                txt_filename = filename[:-4] + '.txt'
-                with open(os.path.join('media', txt_filename), 'w', encoding='utf-8') as txt_file:
-                    txt_file.write(extracted_text)
-                return Response({'message': 'File processed successfully', 'txt_file': txt_filename}, status=status.HTTP_201_CREATED), readpdf(txt_filename)
-            else:
-                return Response({'error': 'Error extracting text from PDF'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+        
+            # Save the extracted text to a .txt file
+            txt_filename = filename[:-4] + '.txt'
+            with open(os.path.join('media', txt_filename), 'w', encoding='utf-8') as txt_file:
+                txt_file.write(extracted_text)
+            return Response({'message': 'File processed successfully', 'txt_file': txt_filename}, status=status.HTTP_201_CREATED), readpdf(txt_filename)
+        # else:
+        #     return Response({'error': 'Error extracting text from PDF'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
             
         return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
     
 
 class PDFRetrieveView(APIView):
-    def get(self, request, name):
+    def retrieve(self, request, name):
         try:
             pdf = PDF.objects.get(name=name)
             return Response({
