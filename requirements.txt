@@ -1,0 +1,11 @@
+# Core Django framework
+Django>=5.1.0,<6.0.0
+
+# Django REST Framework for API development
+djangorestframework>=3.16.0,<4.0.0
+
+# PDF processing library (for future implementation)
+# PyMuPDF>=1.23.0,<2.0.0
+
+# Text-to-speech library (for future implementation)
+# pyttsx3>=2.90,<3.0.0
