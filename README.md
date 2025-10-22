@@ -67,26 +67,32 @@ audiobook-platform/
 ## 🎯 Functional Requirements
 
 1. **PDF Upload & Validation**
+
    - Upload via web or API (max size, PDF/MIME check, virus scan)
    - Store in S3/Blob with unique, secure keys
 
 2. **Text Extraction**
+
    - Extract text using PyMuPDF or cloud OCR for scanned docs
    - Store extracted text as versioned objects
 
 3. **Text-to-Speech (TTS)**
+
    - Convert text to audio using cloud TTS (multi-language, neural voices)
    - Store audio in S3/Blob, support streaming
 
 4. **User Management & Auth**
+
    - OAuth2 login (Google, Microsoft)
    - User dashboard: upload history, file management
 
 5. **API-First**
+
    - RESTful endpoints for all core actions
    - OpenAPI/Swagger docs auto-generated
 
 6. **Web & Mobile UI**
+
    - Modern, accessible SPA (React + Tailwind)
    - Responsive, mobile-first design
 
@@ -99,30 +105,37 @@ audiobook-platform/
 ## 🏗️ Implementation Roadmap
 
 1. **Bootstrap Project**
+
    - Scaffold Django backend, React frontend, Dockerize both
    - Set up CI/CD (GitHub Actions)
 
 2. **Core API & Models**
+
    - Design models: User, Document, ExtractionJob, AudioJob
    - Implement REST endpoints (upload, status, retrieve)
 
 3. **Async Processing**
+
    - Use Celery/RQ for background extraction and TTS
    - Deploy worker containers (Docker/K8s)
 
 4. **Cloud Integration**
+
    - Integrate S3/Blob for storage
    - Integrate Google/Azure/AWS TTS APIs
 
 5. **Frontend**
+
    - Build React SPA: upload, progress, playback, history
    - Use OpenAPI client for API calls
 
 6. **Security & Compliance**
+
    - Enforce file type/size, scan for malware
    - Store secrets in Vault or KMS, never in code
 
 7. **Testing & Monitoring**
+
    - Write unit/integration/E2E tests
    - Set up Sentry, Prometheus, Grafana dashboards
 
