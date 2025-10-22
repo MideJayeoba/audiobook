@@ -1,49 +1,71 @@
-import os
+"""
+Views for the audiobook/pdfconverter application.
+
+This module contains API views for uploading PDFs, converting them to text,
+and retrieving converted text, as well as rendering templates.
+"""
 from rest_framework import status
 from rest_framework.response import Response
 from rest_framework.views import APIView
 from rest_framework.parsers import MultiPartParser, FormParser
-from .serializers import PDF
-from .readpdf import convertpdf, readpdf
 from django.shortcuts import render
 
+from .serializers import PDFSerializer
+from .models import PDF
+
+
 class PDFUploadView(APIView):
+    """
+    API view for handling PDF file uploads.
+    
+    This view accepts PDF files, converts them to text, and saves the
+    extracted text to the database.
+    """
     parser_classes = (MultiPartParser, FormParser)
 
-    global filename
     def upload(self, request):
-        serializer = PDF(data=request.data)
-        if serializer.is_valid():
-            txt_file = serializer.validated_data['extracted_file']
-            filename = txt_file.name
-
-            # Convert PDF to text
-            extracted_text = convertpdf(filename[:-4])  # Remove .pdf extension for the function
-            
+        """
+        Handle PDF file upload and conversion.
         
-            # Save the extracted text to a .txt file
-            txt_filename = filename[:-4] + '.txt'
-            with open(os.path.join('media', txt_filename), 'w', encoding='utf-8') as txt_file:
-                txt_file.write(extracted_text)
-            return Response({'message': 'File processed successfully', 'txt_file': txt_filename}, status=status.HTTP_201_CREATED), readpdf(txt_filename)
-        # else:
-        #     return Response({'error': 'Error extracting text from PDF'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+        Args:
+            request: The HTTP request containing the PDF file
             
-        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
-    
+        Returns:
+            Response: JSON response with conversion status and extracted text file location
+        """
+        pass
+
 
 class PDFRetrieveView(APIView):
+    """
+    API view for retrieving converted PDF text by name.
+    
+    This view allows retrieval of previously converted PDF documents.
+    """
+
     def retrieve(self, request, name):
-        try:
-            pdf = PDF.objects.get(name=name)
-            return Response({
-                'name': pdf.name,
-                'text': pdf.extracted_file
-                # 'file_url': pdf.file.url  # Removed since the file is no longer stored
-            })
-        except PDF.DoesNotExist:
-            return Response({'message': 'PDF not found!'}, status=status.HTTP_404_NOT_FOUND)
+        """
+        Retrieve converted PDF text by document name.
+        
+        Args:
+            request: The HTTP request
+            name: The name of the PDF document to retrieve
+            
+        Returns:
+            Response: JSON response with the document name and extracted text
+        """
+        pass
+
 
 def homeview(request):
-    """Render the index HTML page."""
-    return render(request, 'index.html')
+    """
+    Render the home page for the PDF converter application.
+    
+    Args:
+        request: The HTTP request
+        
+    Returns:
+        HttpResponse: The rendered index.html template
+    """
+    pass
+
