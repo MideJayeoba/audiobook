@@ -19,5 +19,9 @@ class PDFSerializer(serializers.ModelSerializer):
 
     class Meta:
         """Meta options for PDFSerializer."""
+        # Example configuration (uncomment and customize as needed):
+        # model = PDF
+        # fields = ['id', 'name', 'extracted_file', 'created_at']
+        # read_only_fields = ['id', 'created_at']
         pass
 

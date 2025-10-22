@@ -15,6 +15,11 @@ class PDFAdmin(admin.ModelAdmin):
     
     Defines how PDF instances are displayed and managed in the Django admin.
     """
+    # Example configuration (uncomment and customize as needed):
+    # list_display = ['name', 'created_at']
+    # list_filter = ['created_at']
+    # search_fields = ['name']
+    # ordering = ['-created_at']
     pass
 
 

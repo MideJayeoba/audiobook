@@ -15,7 +15,10 @@ class PDF(models.Model):
         extracted_file: The uploaded PDF file
         created_at: Timestamp when the PDF was uploaded
     """
-    pass
+    # Example field definitions (uncomment and customize as needed):
+    # name = models.CharField(max_length=255)
+    # extracted_file = models.FileField(upload_to='pdfs/')
+    # created_at = models.DateTimeField(auto_now_add=True)
 
     def __str__(self):
         """Return string representation of the PDF."""
