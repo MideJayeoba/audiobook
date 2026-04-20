@@ -1,0 +1,75 @@
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    container_name: audiobook-backend
+    command: python manage.py runserver 0.0.0.0:8000
+    working_dir: /app
+    env_file:
+      - .env.example
+    volumes:
+      - ./backend:/app
+    ports:
+      - "8000:8000"
+    depends_on:
+      - db
+
+  services:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    container_name: audiobook-services
+    command: uvicorn src.services.main:app --host 0.0.0.0 --port 8100 --reload
+    working_dir: /app
+    env_file:
+      - .env.example
+    volumes:
+      - ./backend:/app
+    ports:
+      - "8100:8100"
+
+  frontend:
+    build:
+      context: ./frontend
+    container_name: audiobook-frontend
+    command: npm run dev -- --host 0.0.0.0 --port 3000
+    working_dir: /app
+    env_file:
+      - .env.example
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
+    ports:
+      - "3000:3000"
+    depends_on:
+      - backend
+
+  db:
+    image: postgres:16-alpine
+    container_name: audiobook-db
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-audiobook}
+      POSTGRES_USER: ${POSTGRES_USER:-audiobook}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-audiobook}
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+  minio:
+    image: minio/minio:latest
+    container_name: audiobook-minio
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${S3_ACCESS_KEY:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${S3_SECRET_KEY:-minioadmin}
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - minio_data:/data
+
+volumes:
+  postgres_data:
+  minio_data:
