@@ -7,13 +7,17 @@ services:
     command: python manage.py runserver 0.0.0.0:8000
     working_dir: /app
     env_file:
-      - .env.example
+      - .env
     volumes:
       - ./backend:/app
     ports:
       - "8000:8000"
-    depends_on:
-      - db
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/health/', timeout=5)"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
 
   services:
     build:
@@ -23,11 +27,17 @@ services:
     command: uvicorn src.services.main:app --host 0.0.0.0 --port 8100 --reload
     working_dir: /app
     env_file:
-      - .env.example
+      - .env
     volumes:
       - ./backend:/app
     ports:
       - "8100:8100"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8100/health', timeout=5)"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
 
   frontend:
     build:
@@ -36,14 +46,17 @@ services:
     command: npm run dev -- --host 0.0.0.0 --port 3000
     working_dir: /app
     env_file:
-      - .env.example
+      - .env
+    environment:
+      VITE_PROXY_TARGET: http://backend:8000
     volumes:
       - ./frontend:/app
       - /app/node_modules
     ports:
-      - "3000:3000"
+      - "${FRONTEND_PORT:-3000}:3000"
     depends_on:
-      - backend
+      backend:
+        condition: service_healthy
 
   db:
     image: postgres:16-alpine
