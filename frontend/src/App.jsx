@@ -1,4 +1,4 @@
-import { Fragment, useEffect, useMemo, useState } from "react";
+import { Fragment, useEffect, useMemo, useRef, useState } from "react";
 import Header from "./components/Header";
 
 const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || "/api";
@@ -25,6 +25,33 @@ function canStartTts(document) {
   return hasText && (document.status === "extracted" || document.status === "failed");
 }
 
+function normalizeStatusDetail(detail, fallback) {
+  if (typeof detail !== "string") {
+    return fallback;
+  }
+
+  let text = detail.trim();
+  if (!text) {
+    return fallback;
+  }
+
+  if (text.includes("\n")) {
+    text = text.split("\n").find((line) => line.trim())?.trim() || text;
+  }
+
+  text = text.replace(/^Error:\s*/i, "").replace(/^Exception:\s*/i, "").trim();
+
+  if (/^[\[{]/.test(text)) {
+    return fallback;
+  }
+
+  if (text.length > 180) {
+    text = `${text.slice(0, 177)}...`;
+  }
+
+  return text || fallback;
+}
+
 function getMostRecentTime(value) {
   const time = new Date(value || 0).getTime();
   return Number.isFinite(time) ? time : 0;
@@ -45,10 +72,10 @@ async function fetchJson(path) {
   try {
     data = raw ? JSON.parse(raw) : {};
   } catch {
-    data = { detail: raw || "Unexpected non-JSON response from server." };
+    data = { detail: "Unexpected non-JSON response from server." };
   }
   if (!response.ok) {
-    const message = data?.detail || `Request failed (${response.status})`;
+    const message = normalizeStatusDetail(data?.detail, `Request failed (${response.status})`);
     throw new Error(message);
   }
   return data;
@@ -59,7 +86,7 @@ async function parseJsonResponse(response) {
   try {
     return raw ? JSON.parse(raw) : {};
   } catch {
-    return { detail: raw || `Unexpected response (${response.status}).` };
+    return { detail: `Unexpected response (${response.status}).` };
   }
 }
 
@@ -81,7 +108,7 @@ async function uploadDocument(payload) {
       try {
         data = raw ? JSON.parse(raw) : {};
       } catch {
-        data = { detail: raw || "Server returned an unexpected response." };
+        data = { detail: "Server returned an unexpected response." };
       }
 
       return { response, data };
@@ -113,9 +140,21 @@ export default function App() {
   const [semanticResult, setSemanticResult] = useState(null);
   const [statusFilter, setStatusFilter] = useState("all");
   const [expandedDocumentId, setExpandedDocumentId] = useState(null);
+  const [deletingDocumentId, setDeletingDocumentId] = useState(null);
   const [showPastAudiobooks, setShowPastAudiobooks] = useState(false);
   const [showJobHistory, setShowJobHistory] = useState(false);
+  const [voiceOptions, setVoiceOptions] = useState([]);
+  const [selectedVoice, setSelectedVoice] = useState("en-US-AriaNeural");
+  const [sectionsByDocument, setSectionsByDocument] = useState({});
+  const [readerDocumentId, setReaderDocumentId] = useState("");
+  const [selectedSectionByDocument, setSelectedSectionByDocument] = useState({});
+  const [loadingSectionsId, setLoadingSectionsId] = useState(null);
+  const [readingSectionKey, setReadingSectionKey] = useState(null);
+  const [expandedSectionKeys, setExpandedSectionKeys] = useState({});
+  const [activeReadingKey, setActiveReadingKey] = useState(null);
+  const [isReaderPlaying, setIsReaderPlaying] = useState(false);
   const [message, setMessage] = useState("Ready.");
+  const sectionAudioRef = useRef(null);
 
   const filteredDocuments = useMemo(() => {
     const sortedDocuments = [...documents].sort((left, right) => getDocumentTime(right) - getDocumentTime(left));
@@ -164,12 +203,48 @@ export default function App() {
   const visibleExtractionJobs = showJobHistory ? sortedExtractionJobs : sortedExtractionJobs.slice(0, 1);
   const visibleAudioJobs = showJobHistory ? sortedAudioJobs : sortedAudioJobs.slice(0, 1);
   const visibleNavigationEvents = showJobHistory ? sortedNavigationEvents : sortedNavigationEvents.slice(0, 1);
+  const selectedDocument = useMemo(
+    () => documents.find((document) => String(document.id) === String(selectedDocumentId)) || null,
+    [documents, selectedDocumentId]
+  );
+  const readerDocument = useMemo(
+    () => documents.find((document) => String(document.id) === String(readerDocumentId)) || null,
+    [documents, readerDocumentId]
+  );
+  const readerSections = useMemo(() => {
+    if (!readerDocument) {
+      return [];
+    }
+    const sections = sectionsByDocument[readerDocument.id];
+    return Array.isArray(sections) ? sections : [];
+  }, [sectionsByDocument, readerDocument]);
+  const activeReaderSection = useMemo(() => {
+    if (!readerDocument || !readerSections.length) {
+      return null;
+    }
+
+    const selectedIndex = selectedSectionByDocument[readerDocument.id];
+    if (selectedIndex === undefined || selectedIndex === null) {
+      return readerSections[0];
+    }
+
+    return (
+      readerSections.find((section) => Number(section.index) === Number(selectedIndex)) ||
+      readerSections[0]
+    );
+  }, [readerDocument, readerSections, selectedSectionByDocument]);
 
   useEffect(() => {
     if (filteredDocuments.length) {
       setExpandedDocumentId(filteredDocuments[0].id);
     }
   }, [filteredDocuments]);
+
+  useEffect(() => {
+    if (!readerDocumentId && documents.length) {
+      setReaderDocumentId(String(documents[0].id));
+    }
+  }, [documents, readerDocumentId]);
 
   async function loadDashboardData() {
     setIsLoading(true);
@@ -187,9 +262,26 @@ export default function App() {
       setNavigationEvents(Array.isArray(navigation) ? navigation : []);
       setMessage("Documents loaded.");
     } catch (_error) {
-      setMessage(_error instanceof Error ? _error.message : "Could not reach API. Check backend server and API base URL.");
+      const detail = _error instanceof Error ? normalizeStatusDetail(_error.message, "Could not reach API.") : "Could not reach API.";
+      setMessage(detail);
     } finally {
       setIsLoading(false);
+    }
+  }
+
+  async function loadVoiceOptions() {
+    try {
+      const data = await fetchJson("/documents/tts-voices/");
+      const voices = Array.isArray(data?.voices) ? data.voices : [];
+      setVoiceOptions(voices);
+      if (data?.default_voice) {
+        setSelectedVoice(data.default_voice);
+      }
+    } catch {
+      setVoiceOptions([
+        { value: "en-US-AriaNeural", label: "US English - Aria" },
+        { value: "en-US-GuyNeural", label: "US English - Guy" },
+      ]);
     }
   }
 
@@ -199,7 +291,8 @@ export default function App() {
       setDocuments(Array.isArray(data) ? data : []);
       return data;
     } catch (error) {
-      setMessage(error instanceof Error ? error.message : "Could not load documents.");
+      const detail = error instanceof Error ? normalizeStatusDetail(error.message, "Could not load documents.") : "Could not load documents.";
+      setMessage(detail);
       return [];
     }
   }
@@ -224,7 +317,7 @@ export default function App() {
       const { response, data } = await uploadDocument(payload);
 
       if (!response.ok) {
-        const detail = data?.detail || JSON.stringify(data);
+        const detail = normalizeStatusDetail(data?.detail, `Upload failed (${response.status})`);
         setMessage(`Upload failed: ${detail}`);
         return;
       }
@@ -264,12 +357,12 @@ export default function App() {
         headers: {
           "Content-Type": "application/json"
         },
-        body: JSON.stringify({ voice: "en-US-Neural2-J" })
+        body: JSON.stringify({ voice: selectedVoice || "en-US-AriaNeural" })
       });
 
       const data = await parseJsonResponse(response);
       if (!response.ok) {
-        const detail = data?.detail || `Request failed (${response.status})`;
+        const detail = normalizeStatusDetail(data?.detail, `Request failed (${response.status})`);
         setMessage(`TTS failed: ${detail}`);
         await loadDocuments();
         return;
@@ -298,7 +391,7 @@ export default function App() {
       const data = await parseJsonResponse(response);
 
       if (!response.ok) {
-        const detail = data?.detail || `Request failed (${response.status})`;
+        const detail = normalizeStatusDetail(data?.detail, `Request failed (${response.status})`);
         setMessage(`Chapter detection failed: ${detail}`);
         return;
       }
@@ -310,6 +403,37 @@ export default function App() {
       setMessage("Chapter detection failed due to network error.");
     } finally {
       setDetectingChaptersId(null);
+    }
+  }
+
+  async function deleteDocument(documentId) {
+    const keepHistory = window.confirm(
+      "Keep job history for this deleted file?\n\nOK = keep history and remove only the file from Track Progress.\nCancel = delete the file and its job history too."
+    );
+
+    setDeletingDocumentId(documentId);
+    try {
+      const response = await fetch(
+        `${API_BASE_URL}/documents/${documentId}/?keep_history=${keepHistory ? "true" : "false"}`,
+        {
+          method: "DELETE"
+        }
+      );
+
+      if (!response.ok && response.status !== 204) {
+        const data = await parseJsonResponse(response);
+        const detail = normalizeStatusDetail(data?.detail, `Request failed (${response.status})`);
+        setMessage(`Delete failed: ${detail}`);
+        return;
+      }
+
+      setMessage(keepHistory ? "File deleted. Job history kept." : "File and job history deleted.");
+      setExpandedDocumentId((current) => (current === documentId ? null : current));
+      await loadDashboardData();
+    } catch (_error) {
+      setMessage("Delete failed due to network error.");
+    } finally {
+      setDeletingDocumentId(null);
     }
   }
 
@@ -333,7 +457,7 @@ export default function App() {
       const data = await parseJsonResponse(response);
 
       if (!response.ok) {
-        const detail = data?.detail || `Request failed (${response.status})`;
+        const detail = normalizeStatusDetail(data?.detail, `Request failed (${response.status})`);
         setMessage(`Semantic seek failed: ${detail}`);
         return;
       }
@@ -348,11 +472,174 @@ export default function App() {
     }
   }
 
+  async function seekToChapter(documentId, chapterIndex) {
+    try {
+      const response = await fetch(`${API_BASE_URL}/documents/${documentId}/seek/`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({ chapter_index: chapterIndex })
+      });
+
+      const data = await parseJsonResponse(response);
+      if (!response.ok) {
+        const detail = normalizeStatusDetail(data?.detail, `Request failed (${response.status})`);
+        setMessage(`Chapter jump failed: ${detail}`);
+        return;
+      }
+
+      setMessage(`Jumped to ${data.chapter_title || `chapter ${chapterIndex + 1}`}.`);
+      await loadDashboardData();
+    } catch (_error) {
+      setMessage("Chapter jump failed due to network error.");
+    }
+  }
+
+  async function loadSections(documentId, options = {}) {
+    const { preserveSelection = true } = options;
+    setLoadingSectionsId(documentId);
+    try {
+      const data = await fetchJson(`/documents/${documentId}/sections/`);
+      const sections = Array.isArray(data?.sections) ? data.sections : [];
+      setSectionsByDocument((prev) => ({
+        ...prev,
+        [documentId]: sections
+      }));
+      if (sections.length > 0 && !preserveSelection) {
+        setSelectedSectionByDocument((prev) => ({
+          ...prev,
+          [documentId]: sections[0].index
+        }));
+      }
+    } catch (error) {
+      const detail = error instanceof Error ? normalizeStatusDetail(error.message, "Could not load sections.") : "Could not load sections.";
+      setMessage(detail);
+    } finally {
+      setLoadingSectionsId(null);
+    }
+  }
+
+  async function readSection(documentId, sectionIndex) {
+    const sectionKey = `${documentId}:${sectionIndex}`;
+    setReadingSectionKey(sectionKey);
+    try {
+      const response = await fetch(`${API_BASE_URL}/documents/${documentId}/read-section/`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({ section_index: sectionIndex, voice: selectedVoice })
+      });
+
+      const data = await parseJsonResponse(response);
+      if (!response.ok) {
+        const detail = normalizeStatusDetail(data?.detail, `Request failed (${response.status})`);
+        setMessage(`Read section failed: ${detail}`);
+        return;
+      }
+
+      if (!sectionAudioRef.current) {
+        sectionAudioRef.current = new Audio();
+      }
+      sectionAudioRef.current.src = data.audio_url;
+      await sectionAudioRef.current.play();
+      setActiveReadingKey(sectionKey);
+      setIsReaderPlaying(true);
+
+      setMessage(`Now reading: ${data.section_title || `Section ${sectionIndex + 1}`}.`);
+    } catch (_error) {
+      setMessage("Read section failed due to network error.");
+    } finally {
+      setReadingSectionKey(null);
+    }
+  }
+
+  async function toggleReaderPlayback() {
+    const audioNode = sectionAudioRef.current;
+    if (!audioNode || !audioNode.src) {
+      setMessage("Select a section and tap Read Now first.");
+      return;
+    }
+
+    if (audioNode.paused) {
+      try {
+        await audioNode.play();
+        setIsReaderPlaying(true);
+        setMessage("Playback resumed.");
+      } catch {
+        setMessage("Unable to resume playback.");
+      }
+      return;
+    }
+
+    audioNode.pause();
+    setIsReaderPlaying(false);
+    setMessage("Playback paused.");
+  }
+
+  function sectionKey(documentId, sectionIndex) {
+    return `${documentId}:${sectionIndex}`;
+  }
+
+  function selectReaderSection(documentId, sectionIndex) {
+    setSelectedSectionByDocument((prev) => ({
+      ...prev,
+      [documentId]: sectionIndex
+    }));
+  }
+
+  function isSectionExpanded(documentId, sectionIndex) {
+    return Boolean(expandedSectionKeys[sectionKey(documentId, sectionIndex)]);
+  }
+
+  function toggleSectionExpanded(documentId, sectionIndex) {
+    const key = sectionKey(documentId, sectionIndex);
+    setExpandedSectionKeys((prev) => ({
+      ...prev,
+      [key]: !prev[key]
+    }));
+  }
+
   useEffect(() => {
     loadDashboardData();
-    const id = setInterval(loadDashboardData, 5000);
-    return () => clearInterval(id);
+    loadVoiceOptions();
   }, []);
+
+  useEffect(() => {
+    const audioNode = sectionAudioRef.current;
+    if (!audioNode) {
+      return;
+    }
+
+    const onEnded = () => {
+      setIsReaderPlaying(false);
+      setActiveReadingKey(null);
+    };
+    const onPause = () => setIsReaderPlaying(false);
+    const onPlay = () => setIsReaderPlaying(true);
+
+    audioNode.addEventListener("ended", onEnded);
+    audioNode.addEventListener("pause", onPause);
+    audioNode.addEventListener("play", onPlay);
+
+    return () => {
+      audioNode.removeEventListener("ended", onEnded);
+      audioNode.removeEventListener("pause", onPause);
+      audioNode.removeEventListener("play", onPlay);
+    };
+  }, [sectionAudioRef.current]);
+
+  useEffect(() => {
+    if (!readerDocument) {
+      return;
+    }
+
+    const existingSections = sectionsByDocument[readerDocument.id];
+    if (!Array.isArray(existingSections) || existingSections.length === 0) {
+      loadSections(readerDocument.id, { preserveSelection: false });
+    }
+  }, [readerDocument, sectionsByDocument]);
 
   return (
     <div className="min-h-screen bg-slate-950 text-slate-100">
@@ -439,6 +726,27 @@ export default function App() {
               </button>
             </form>
 
+            {selectedDocument?.ai_summary && (
+              <div className="mt-4 rounded-md border border-cyan-700/40 bg-cyan-500/10 p-4 text-sm text-cyan-100">
+                <p className="text-xs uppercase tracking-wide text-cyan-300">AI Summary</p>
+                <p className="mt-1 text-cyan-50/90">{selectedDocument.ai_summary}</p>
+                {Array.isArray(selectedDocument.chapter_map) && selectedDocument.chapter_map.length > 0 && (
+                  <div className="mt-3 flex flex-wrap gap-2">
+                    {selectedDocument.chapter_map.slice(0, 5).map((chapter, index) => (
+                      <button
+                        key={`${selectedDocument.id}-chapter-${chapter.index ?? index}`}
+                        type="button"
+                        onClick={() => seekToChapter(selectedDocument.id, chapter.index ?? index)}
+                        className="rounded-full bg-cyan-700/70 px-3 py-1 text-xs font-medium text-white transition hover:bg-cyan-700"
+                      >
+                        {chapter.title || `Chapter ${index + 1}`}
+                      </button>
+                    ))}
+                  </div>
+                )}
+              </div>
+            )}
+
             {semanticResult && (
               <div className="mt-4 rounded-md border border-violet-700/40 bg-violet-500/10 p-4 text-sm text-violet-100">
                 <p>
@@ -455,6 +763,117 @@ export default function App() {
             )}
           </section>
         </div>
+
+        <section className="rounded-xl border border-slate-800 bg-slate-900/80 p-6">
+          <h2 className="text-xl font-semibold text-white">Reader Mode</h2>
+          <p className="mt-2 text-sm text-slate-300">
+            Choose a document and section, then read it like a chaptered book.
+          </p>
+
+          <div className="mt-4 grid gap-4 lg:grid-cols-[280px_1fr]">
+            <div className="space-y-3 rounded-lg border border-slate-800 bg-slate-950/60 p-3">
+              <label className="block text-xs uppercase tracking-wide text-slate-400">Document</label>
+              <select
+                value={readerDocumentId}
+                onChange={(event) => {
+                  const nextId = event.target.value;
+                  setReaderDocumentId(nextId);
+                  const nextDoc = documents.find((document) => String(document.id) === String(nextId));
+                  if (nextDoc) {
+                    loadSections(nextDoc.id, { preserveSelection: false });
+                  }
+                }}
+                className="w-full rounded-md border border-slate-700 bg-slate-950 px-3 py-2 text-sm text-slate-100 outline-none focus:border-brand-500"
+              >
+                <option value="">Select a document</option>
+                {seekableDocuments.map((document) => (
+                  <option key={document.id} value={document.id}>
+                    {document.title}
+                  </option>
+                ))}
+              </select>
+
+              <div className="flex items-center justify-between">
+                <p className="text-xs uppercase tracking-wide text-slate-400">Sections</p>
+                {readerDocument && (
+                  <button
+                    type="button"
+                    onClick={() => loadSections(readerDocument.id, { preserveSelection: false })}
+                    disabled={loadingSectionsId === readerDocument.id}
+                    className="rounded-md bg-slate-700 px-2 py-1 text-xs font-medium text-slate-100 transition hover:bg-slate-600 disabled:opacity-50"
+                  >
+                    {loadingSectionsId === readerDocument.id ? "Loading..." : "Reload"}
+                  </button>
+                )}
+              </div>
+
+              <div className="max-h-64 space-y-2 overflow-y-auto pr-1">
+                {readerSections.map((section, index) => {
+                  const isActive = Number(activeReaderSection?.index) === Number(section.index);
+                  return (
+                    <button
+                      key={`${readerDocument?.id || "doc"}-reader-${section.index}`}
+                      type="button"
+                      onClick={() => readerDocument && selectReaderSection(readerDocument.id, section.index)}
+                      className={`w-full rounded-md px-3 py-2 text-left text-xs transition ${
+                        isActive
+                          ? "bg-brand-500 text-white"
+                          : "bg-slate-900 text-slate-200 hover:bg-slate-800"
+                      }`}
+                    >
+                      {section.title || `Section ${index + 1}`}
+                    </button>
+                  );
+                })}
+                {!readerSections.length && (
+                  <p className="text-xs text-slate-400">No sections loaded yet.</p>
+                )}
+              </div>
+            </div>
+
+            <div className="rounded-lg border border-slate-800 bg-slate-950/60 p-4">
+              {activeReaderSection ? (
+                <>
+                  <div className="flex flex-wrap items-center justify-between gap-3">
+                    <h3 className="text-lg font-semibold text-slate-100">
+                      {activeReaderSection.title || `Section ${Number(activeReaderSection.index) + 1}`}
+                    </h3>
+                    <div className="flex flex-wrap items-center gap-2">
+                      {readerDocument && (
+                        <button
+                          type="button"
+                          onClick={() => readSection(readerDocument.id, activeReaderSection.index)}
+                          disabled={readingSectionKey === `${readerDocument.id}:${activeReaderSection.index}`}
+                          className="rounded-md bg-emerald-600 px-3 py-2 text-xs font-medium text-white transition hover:bg-emerald-700 disabled:cursor-not-allowed disabled:opacity-50"
+                        >
+                          {readingSectionKey === `${readerDocument.id}:${activeReaderSection.index}` ? "Reading..." : "Read Now"}
+                        </button>
+                      )}
+                      <button
+                        type="button"
+                        onClick={toggleReaderPlayback}
+                        disabled={!activeReadingKey}
+                        className="rounded-md bg-slate-700 px-3 py-2 text-xs font-medium text-slate-100 transition hover:bg-slate-600 disabled:cursor-not-allowed disabled:opacity-50"
+                      >
+                        {isReaderPlaying ? "Pause" : "Continue"}
+                      </button>
+                    </div>
+                  </div>
+                  {activeReadingKey && (
+                    <p className="mt-2 text-xs text-emerald-300">
+                      {isReaderPlaying ? "Now playing" : "Paused"}: {activeReaderSection.title || `Section ${Number(activeReaderSection.index) + 1}`}
+                    </p>
+                  )}
+                  <p className="mt-3 max-h-80 overflow-y-auto whitespace-pre-wrap text-sm leading-6 text-slate-200">
+                    {activeReaderSection.text || activeReaderSection.excerpt}
+                  </p>
+                </>
+              ) : (
+                <p className="text-sm text-slate-400">Select a document and section to read.</p>
+              )}
+            </div>
+          </div>
+        </section>
 
         <section className="rounded-xl border border-slate-800 bg-slate-900/80 p-6">
           <h2 className="text-xl font-semibold text-white">Track Progress</h2>
@@ -475,6 +894,21 @@ export default function App() {
             >
               {isLoading ? "Refreshing..." : "Refresh status"}
             </button>
+
+            <label className="flex items-center gap-2 text-sm text-slate-200">
+              <span>Voice</span>
+              <select
+                value={selectedVoice}
+                onChange={(event) => setSelectedVoice(event.target.value)}
+                className="rounded-md border border-slate-700 bg-slate-950 px-3 py-2 text-sm text-slate-100 outline-none focus:border-brand-500"
+              >
+                {(voiceOptions.length ? voiceOptions : [{ value: "en-US-AriaNeural", label: "US English - Aria" }]).map((voice) => (
+                  <option key={voice.value} value={voice.value}>
+                    {voice.label || voice.value}
+                  </option>
+                ))}
+              </select>
+            </label>
           </div>
           <div className="mt-4 flex flex-wrap gap-2">
             {[
@@ -536,62 +970,29 @@ export default function App() {
                         >
                           {expandedDocumentId === document.id ? "Hide details" : "Show details"}
                         </button>
+                          <button
+                            type="button"
+                            onClick={() => deleteDocument(document.id)}
+                            disabled={deletingDocumentId === document.id}
+                            className="mt-2 rounded-md bg-rose-600 px-3 py-1 text-xs font-medium text-white transition hover:bg-rose-700 disabled:cursor-not-allowed disabled:opacity-50"
+                          >
+                            {deletingDocumentId === document.id ? "Deleting..." : "Delete"}
+                          </button>
                       </td>
                     </tr>
                     {expandedDocumentId === document.id && (
                       <tr className="border-b border-slate-800/70 bg-slate-900/50">
                         <td className="px-2 py-3 text-slate-300" colSpan={5}>
-                          <div className="grid gap-3 md:grid-cols-[1.3fr_1fr_auto] md:items-start">
-                            <div className="space-y-2">
-                              <p className="text-xs uppercase tracking-wide text-slate-400">Audio</p>
-                              {document.audio_url ? (
-                                <audio controls preload="none" className="h-8 w-full max-w-96" src={document.audio_url}>
-                                  Your browser does not support audio playback.
-                                </audio>
-                              ) : (
-                                <p className="text-sm text-slate-400">No audio available yet.</p>
-                              )}
-                            </div>
-
-                            <div className="space-y-2">
-                              <p className="text-xs uppercase tracking-wide text-slate-400">TTS</p>
-                              <button
-                                type="button"
-                                onClick={() => startTts(document.id)}
-                                disabled={startingTtsId === document.id || !canStartTts(document)}
-                                className="rounded-md bg-indigo-600 px-3 py-1 text-xs font-medium text-white transition hover:bg-indigo-700 disabled:cursor-not-allowed disabled:opacity-50"
-                              >
-                                <span className="inline-flex items-center gap-2">
-                                  {startingTtsId === document.id && (
-                                    <span className="h-3 w-3 animate-spin rounded-full border border-white/40 border-t-white" />
-                                  )}
-                                  {startingTtsId === document.id
-                                    ? "Starting..."
-                                    : document.status === "failed"
-                                      ? "Retry TTS"
-                                      : "Start TTS"}
-                                </span>
-                              </button>
-                              {document.status === "failed" && (
-                                <p className="text-xs text-rose-300">
-                                  {latestAudioJobByDocument[document.id]?.error_message ||
-                                    latestExtractionJobByDocument[document.id]?.error_message ||
-                                    "Last run failed. Check job history for details."}
-                                </p>
-                              )}
-                            </div>
-
-                            <div className="space-y-2">
-                              <p className="text-xs uppercase tracking-wide text-slate-400">Chapters</p>
-                              <button
-                                type="button"
-                                onClick={() => detectChapters(document.id)}
-                                disabled={detectingChaptersId === document.id || !document.has_extracted_text}
-                                className="rounded-md bg-cyan-700 px-3 py-1 text-xs font-medium text-white transition hover:bg-cyan-800 disabled:cursor-not-allowed disabled:opacity-50"
-                              >
-                                {detectingChaptersId === document.id ? "Detecting..." : "Detect Chapters"}
-                              </button>
-                            </div>
+                          <div className="space-y-2">
+                            <p className="text-xs uppercase tracking-wide text-slate-400">Summary</p>
+                            {document.ai_summary ? (
+                              <p className="text-sm text-slate-300">{document.ai_summary}</p>
+                            ) : (
+                              <p className="text-sm text-slate-400">No summary yet. Use Reader Mode to load sections and read.</p>
+                            )}
+                            <p className="text-xs text-slate-400">
+                              Reading controls were moved to Reader Mode to keep Track Progress focused on status.
+                            </p>
                           </div>
                         </td>
                       </tr>

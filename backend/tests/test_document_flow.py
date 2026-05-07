@@ -1,5 +1,6 @@
 import pytest
 from django.apps import apps
+from django.conf import settings
 from django.contrib.auth import get_user_model
 from django.core.files.uploadedfile import SimpleUploadedFile
 from rest_framework.test import APIClient
@@ -44,7 +45,8 @@ def build_pdf_bytes(text: str) -> bytes:
 
 
 @pytest.mark.django_db
-def test_document_upload_triggers_extraction_stub():
+def test_document_upload_triggers_extraction_stub(monkeypatch):
+    monkeypatch.setenv("AUTO_DETECT_CHAPTERS", "true")
     user = get_user_model().objects.create_user(username="learner", password="secret123")
     client = APIClient()
     client.force_authenticate(user=user)
@@ -73,6 +75,9 @@ def test_document_upload_triggers_extraction_stub():
     assert extraction_job.status == ExtractionJob.Status.SUCCEEDED
     assert extraction_job.provider == "pypdf+ocr"
     assert expected_text in extraction_job.text_preview
+    assert isinstance(response.data["chapter_map"], list)
+    assert len(response.data["chapter_map"]) >= 1
+    assert response.data["ai_summary"]
 
 
 @pytest.mark.django_db
@@ -254,7 +259,7 @@ def test_semantic_seek_returns_position_and_updates_document():
 
     assert response.status_code == 200
     assert "position_seconds" in response.data
-    assert response.data["provider"] in {"huggingface", "keyword-fallback"}
+    assert response.data["provider"] in {"huggingface+hints", "keyword-fallback"}
     assert "fallback_used" in response.data
     assert "latency_ms" in response.data
 
@@ -297,7 +302,7 @@ def test_playback_seek_returns_audio_url_and_target_offset():
     assert response.status_code == 200
     assert response.data["audio_local_ref"] == "local://document-123.mp3"
     assert "target_offset_seconds" in response.data
-    assert response.data["provider"] in {"huggingface", "keyword-fallback"}
+    assert response.data["provider"] in {"huggingface+hints", "keyword-fallback"}
     assert "fallback_used" in response.data
     assert "latency_ms" in response.data
 
@@ -396,3 +401,90 @@ def test_job_history_endpoints_return_user_scoped_records():
     assert extraction_response.data[0]["id"] == extraction_job.id
     assert audio_response.data[0]["id"] == audio_job.id
     assert navigation_response.data[0]["document"] == document.id
+
+
+@pytest.mark.django_db
+def test_delete_document_can_keep_job_history_and_remove_files():
+    user = get_user_model().objects.create_user(username="learner12", password="secret123")
+    client = APIClient()
+    client.force_authenticate(user=user)
+
+    source_file = SimpleUploadedFile(
+        "delete-me.pdf",
+        build_pdf_bytes("Delete me"),
+        content_type="application/pdf",
+    )
+    document = Document.objects.create(
+        user=user,
+        title="Delete Me",
+        source_file=source_file,
+        extracted_text="Delete me text",
+        audio_url="/media/audio/delete-me.wav",
+        audio_local_ref="local://delete-me.wav",
+        status=Document.Status.COMPLETED,
+    )
+    extraction_job = ExtractionJob.objects.create(
+        user=user,
+        document=document,
+        source_name="delete-me.pdf",
+        status=ExtractionJob.Status.SUCCEEDED,
+    )
+    audio_job = AudioJob.objects.create(
+        user=user,
+        document=document,
+        voice="en-US-Neural2-J",
+        status=AudioJob.Status.SUCCEEDED,
+    )
+    navigation_event = ChapterNavigationEvent.objects.create(
+        user=user,
+        document=document,
+        event_type=ChapterNavigationEvent.EventType.SEMANTIC_SEEK,
+    )
+
+    source_file_name = document.source_file.name
+    audio_path = settings.MEDIA_ROOT / "audio" / "delete-me.wav"
+    audio_path.parent.mkdir(parents=True, exist_ok=True)
+    audio_path.write_bytes(b"audio")
+
+    response = client.delete(f"/api/documents/{document.id}/?keep_history=true")
+
+    assert response.status_code == 204
+    assert not Document.objects.filter(id=document.id, is_deleted=False).exists()
+    assert Document.objects.filter(id=document.id, is_deleted=True).exists()
+    assert ExtractionJob.objects.filter(id=extraction_job.id).exists()
+    assert AudioJob.objects.filter(id=audio_job.id).exists()
+    assert ChapterNavigationEvent.objects.filter(id=navigation_event.id).exists()
+    assert not audio_path.exists()
+    assert source_file_name and not document.source_file.storage.exists(source_file_name)
+
+    document.refresh_from_db()
+    assert document.source_file.name == ""
+    assert document.audio_url == ""
+    assert document.audio_local_ref == ""
+
+
+@pytest.mark.django_db
+def test_delete_document_can_remove_job_history():
+    user = get_user_model().objects.create_user(username="learner13", password="secret123")
+    client = APIClient()
+    client.force_authenticate(user=user)
+
+    document = Document.objects.create(
+        user=user,
+        title="Delete Everything",
+        source_file="documents/delete-everything.pdf",
+        extracted_text="Delete everything text",
+        status=Document.Status.EXTRACTED,
+    )
+    extraction_job = ExtractionJob.objects.create(
+        user=user,
+        document=document,
+        source_name="delete-everything.pdf",
+        status=ExtractionJob.Status.SUCCEEDED,
+    )
+
+    response = client.delete(f"/api/documents/{document.id}/?keep_history=false")
+
+    assert response.status_code == 204
+    assert not Document.objects.filter(id=document.id).exists()
+    assert not ExtractionJob.objects.filter(id=extraction_job.id).exists()

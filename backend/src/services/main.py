@@ -3,7 +3,7 @@ from pydantic import BaseModel
 
 from .ai_navigation import detect_chapters_ai, seek_in_chapters, semantic_seek_ai
 from .extraction import extract_text_from_pdf
-from .tts import build_public_audio_url, synthesize_speech_to_file
+from .tts import build_public_audio_url, synthesize_speech
 
 app = FastAPI(title="Audiobook Async Services", version="0.1.0")
 
@@ -49,9 +49,9 @@ def extract(payload: ExtractionRequest):
 
 @app.post("/v1/tts")
 def tts(payload: TTSRequest):
-    audio_path = synthesize_speech_to_file(payload.text, payload.voice)
-    audio_url = build_public_audio_url(audio_path)
-    return {"document_id": payload.document_id, "audio_url": audio_url}
+    tts_result = synthesize_speech(payload.text, payload.voice)
+    audio_url = build_public_audio_url(tts_result.audio_path)
+    return {"document_id": payload.document_id, "audio_url": audio_url, "provider": tts_result.provider}
 
 
 @app.post("/v1/chapters/detect")

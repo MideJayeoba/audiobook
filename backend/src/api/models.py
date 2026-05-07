@@ -26,6 +26,8 @@ class Document(models.Model):
     audio_local_ref = models.CharField(max_length=255, blank=True)
     audio_duration_seconds = models.FloatField(default=0.0)
     status = models.CharField(max_length=32, choices=Status.choices, default=Status.UPLOADED)
+    is_deleted = models.BooleanField(default=False)
+    deleted_at = models.DateTimeField(null=True, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 

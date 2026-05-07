@@ -72,6 +72,7 @@ class DocumentSerializer(serializers.ModelSerializer):
 class DocumentListSerializer(serializers.ModelSerializer):
     has_extracted_text = serializers.SerializerMethodField()
     has_chapter_map = serializers.SerializerMethodField()
+    chapter_count = serializers.SerializerMethodField()
 
     def get_has_extracted_text(self, obj):
         return obj.status in {"extracted", "tts_processing", "completed", "failed"}
@@ -79,6 +80,12 @@ class DocumentListSerializer(serializers.ModelSerializer):
     def get_has_chapter_map(self, obj):
         chapter_map = getattr(obj, "chapter_map", None)
         return isinstance(chapter_map, list) and len(chapter_map) > 0
+
+    def get_chapter_count(self, obj):
+        chapter_map = getattr(obj, "chapter_map", None)
+        if not isinstance(chapter_map, list):
+            return 0
+        return len(chapter_map)
 
     class Meta:
         model = Document
@@ -91,6 +98,9 @@ class DocumentListSerializer(serializers.ModelSerializer):
             "audio_url",
             "audio_local_ref",
             "audio_duration_seconds",
+            "ai_summary",
+            "chapter_map",
+            "chapter_count",
             "status",
             "has_extracted_text",
             "has_chapter_map",
