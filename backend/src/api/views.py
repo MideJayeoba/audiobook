@@ -1,744 +1,125 @@
 import os
+import tempfile
 from pathlib import Path
-from urllib.parse import unquote, urlparse
 
-from django.conf import settings
-from django.contrib.auth import get_user_model
-from django.utils import timezone
-from rest_framework import permissions, status, viewsets
-from rest_framework.decorators import action, api_view, permission_classes
+from django.http import HttpResponse, StreamingHttpResponse
+from rest_framework.decorators import api_view, permission_classes, parser_classes
+from rest_framework.parsers import MultiPartParser
+from rest_framework.permissions import AllowAny
 from rest_framework.response import Response
+from django.core.files.uploadedfile import UploadedFile
 
-from services.ai_navigation import detect_chapters_ai, seek_in_chapters, semantic_seek_ai
 from services.extraction import extract_text_from_pdf
-from services.tts import build_public_audio_url, get_edge_voice_options, synthesize_speech
-
-from .models import AudioJob, ChapterNavigationEvent, Document, ExtractionJob
-from .serializers import (
-    AudioJobSerializer,
-    ChapterNavigationEventSerializer,
-    DocumentListSerializer,
-    DocumentSerializer,
-    ExtractionJobSerializer,
-)
-
+from services.ai_navigation import detect_chapters_ai
+from services.tts import synthesize_speech, get_edge_voice_options
 
 @api_view(["GET"])
-@permission_classes([permissions.AllowAny])
+@permission_classes([AllowAny])
 def health_check(_request):
-    return Response({"status": "ok", "service": "django-api"})
+    return Response({"status": "ok", "service": "django-api-stateless"})
 
+@api_view(["POST"])
+@permission_classes([AllowAny])
+@parser_classes([MultiPartParser])
+def extract_document(request):
+    file: UploadedFile = request.FILES.get("source_file")
+    if not file:
+        return Response({"detail": "source_file is required"}, status=400)
+    
+    try:
+        text = extract_text_from_pdf(file.file)
+        return Response({"text": text})
+    except Exception as e:
+        return Response({"detail": str(e)}, status=500)
 
-class DocumentViewSet(viewsets.ModelViewSet):
-    serializer_class = DocumentSerializer
+@api_view(["POST"])
+@permission_classes([AllowAny])
+def ai_sections(request):
+    text = request.data.get("text", "")
+    if not text:
+        return Response({"detail": "text is required"}, status=400)
+    
+    try:
+        result = detect_chapters_ai(text)
+        return Response(result)
+    except Exception as e:
+        return Response({"detail": str(e)}, status=500)
 
-    def get_serializer_class(self):
-        if self.action == "list":
-            return DocumentListSerializer
-        return DocumentSerializer
+@api_view(["POST"])
+@permission_classes([AllowAny])
+def tts_stream(request):
+    text = request.data.get("text", "")
+    voice = request.data.get("voice", "en-NG-AbeoNeural")
+    if not text:
+        return Response({"detail": "text is required"}, status=400)
+        
+    try:
+        # Edge-TTS is the deployment provider (neural voices, incl. Nigerian
+        # accents). gTTS/espeak remain as local-dev fallbacks only.
+        result = synthesize_speech(text, voice, preferred_provider="edge")
 
-    def _auto_start_tts_enabled(self) -> bool:
-        return os.getenv("AUTO_START_TTS", "true").strip().lower() == "true"
-
-    def _auto_detect_chapters_enabled(self) -> bool:
-        return os.getenv("AUTO_DETECT_CHAPTERS", "true").strip().lower() == "true"
-
-    def _resolve_actor(self, request):
-        if request.user.is_authenticated:
-            return request.user
-
-        user_model = get_user_model()
-        guest_username = os.getenv("DEV_GUEST_USERNAME", "guest")
-        guest_user, _ = user_model.objects.get_or_create(
-            username=guest_username,
-            defaults={"email": f"{guest_username}@local.dev"},
-        )
-        return guest_user
-
-    def _create_extraction_job(self, document: Document) -> ExtractionJob:
-        return ExtractionJob.objects.create(
-            user=document.user,
-            document=document,
-            source_name=document.source_name,
-            source_mime_type=document.source_mime_type,
-            source_size_bytes=document.source_size_bytes,
-            storage_mode=document.storage_mode,
-            status=ExtractionJob.Status.QUEUED,
-        )
-
-    def _create_audio_job(self, document: Document, voice: str) -> AudioJob:
-        return AudioJob.objects.create(
-            user=document.user,
-            document=document,
-            voice=voice,
-            status=AudioJob.Status.QUEUED,
-        )
-
-    def _delete_file_path(self, file_path: Path) -> None:
-        try:
-            if file_path.is_file():
+        def file_iterator(file_path: Path):
+            with file_path.open('rb') as f:
+                while chunk := f.read(8192):
+                    yield chunk
+            # cleanup after sending
+            try:
                 file_path.unlink()
-        except OSError:
-            pass
-
-    def _cleanup_document_files(self, document: Document) -> None:
-        if document.source_file:
-            try:
-                document.source_file.delete(save=False)
-            except Exception:
+            except OSError:
                 pass
+                
+        response = StreamingHttpResponse(file_iterator(result.audio_path), content_type="audio/mpeg")
+        response['Content-Disposition'] = f'inline; filename="{result.audio_path.name}"'
+        return response
+    except Exception as e:
+        return Response({"detail": str(e)}, status=500)
 
-        if document.audio_local_ref:
-            audio_name = document.audio_local_ref.replace("local://", "", 1)
-            if audio_name:
-                self._delete_file_path(Path(settings.MEDIA_ROOT) / "audio" / audio_name)
-        elif document.audio_url:
-            parsed_url = urlparse(document.audio_url)
-            media_path = unquote(parsed_url.path or "").lstrip("/")
-            if media_path.startswith("media/"):
-                relative_path = media_path.split("media/", 1)[1]
-                if relative_path:
-                    self._delete_file_path(Path(settings.MEDIA_ROOT) / relative_path)
+from django.views.decorators.csrf import csrf_exempt
+from django.http import JsonResponse
+import json
+import uuid
+from services.tts import stream_edge_tts
 
-    def _run_tts_pipeline(self, document: Document, voice: str, base_url: str | None = None) -> None:
-        audio_job = self._create_audio_job(document, voice)
+_TTS_PREPARE_CACHE = {}
 
-        audio_job.status = AudioJob.Status.RUNNING
-        audio_job.started_at = timezone.now()
-        audio_job.save(update_fields=["status", "started_at", "updated_at"])
+@csrf_exempt
+def prepare_tts(request):
+    if request.method != "POST":
+        return JsonResponse({"detail": "POST required"}, status=405)
+    try:
+        body = json.loads(request.body)
+        token = str(uuid.uuid4())
+        _TTS_PREPARE_CACHE[token] = body
+        return JsonResponse({"token": token})
+    except Exception as e:
+        return JsonResponse({"detail": str(e)}, status=500)
 
-        document.status = Document.Status.TTS_PROCESSING
-        document.save(update_fields=["status", "updated_at"])
-
-        tts_result = synthesize_speech(document.extracted_text, voice)
-        audio_path = tts_result.audio_path
-        generated_audio_url = build_public_audio_url(audio_path, base_url=base_url)
-        document.audio_local_ref = f"local://{Path(audio_path).name}"
-        document.audio_url = generated_audio_url
-        document.audio_duration_seconds = max(
-            document.audio_duration_seconds,
-            round(max(1, len(document.extracted_text.split())) / 2.5, 2),
-        )
-        document.status = Document.Status.COMPLETED
-        document.save(
-            update_fields=["audio_url", "audio_local_ref", "audio_duration_seconds", "status", "updated_at"]
-        )
-
-        audio_job.audio_url = document.audio_url
-        audio_job.audio_local_ref = document.audio_local_ref
-        audio_job.audio_duration_seconds = document.audio_duration_seconds
-        audio_job.provider = tts_result.provider
-        audio_job.status = AudioJob.Status.SUCCEEDED
-        audio_job.completed_at = timezone.now()
-        audio_job.save(
-            update_fields=[
-                "audio_url",
-                "audio_local_ref",
-                "audio_duration_seconds",
-                "provider",
-                "status",
-                "completed_at",
-                "updated_at",
-            ]
-        )
-
-    def _record_navigation_event(self, document: Document, event_type: str, result: dict, query: str = "", payload: dict | None = None):
-        ChapterNavigationEvent.objects.create(
-            user=document.user,
-            document=document,
-            event_type=event_type,
-            query=query,
-            chapter_index=result.get("chapter_index"),
-            chapter_title=result.get("chapter_title", "") or "",
-            position_seconds=float(result.get("position_seconds", 0.0)),
-            confidence=float(result.get("confidence", 0.0)),
-            provider=str(result.get("provider", "")),
-            fallback_used=bool(result.get("fallback_used", False)),
-            match_excerpt=str(result.get("match_excerpt", "")),
-            payload=payload or {},
-        )
-
-    def _build_document_sections(self, document: Document) -> list[dict]:
-        text = (document.extracted_text or "").strip()
+@csrf_exempt
+async def tts_stream_direct(request):
+    try:
+        if request.method == "GET":
+            token = request.GET.get("token")
+            if not token:
+                return JsonResponse({"detail": "token required"}, status=400)
+            body = _TTS_PREPARE_CACHE.get(token)
+            if not body:
+                return JsonResponse({"detail": "invalid or expired token"}, status=404)
+        else:
+            body = json.loads(request.body)
+            
+        text = body.get("text", "")
+        voice = body.get("voice", "en-NG-AbeoNeural")
+        
         if not text:
-            return []
-
-        chapters = list(document.chapter_map or [])
-        if not chapters:
-            words = text.split()
-            chunk_count = max(1, min(8, len(words) // 220 or 1))
-            chunk_size = max(1, len(words) // chunk_count)
-            sections = []
-            for index in range(chunk_count):
-                chunk_words = words[index * chunk_size : (index + 1) * chunk_size]
-                chunk_text = " ".join(chunk_words).strip()
-                if not chunk_text:
-                    continue
-                sections.append(
-                    {
-                        "index": index,
-                        "title": f"Section {index + 1}",
-                        "text": chunk_text,
-                        "excerpt": chunk_text[:280],
-                        "start_seconds": float(index * 300),
-                        "end_seconds": float((index + 1) * 300),
-                    }
-                )
-            return sections
-
-        words = text.split()
-        section_count = max(1, len(chapters))
-        chunk_size = max(1, len(words) // section_count)
-        sections = []
-
-        for index, chapter in enumerate(chapters):
-            chapter_index = int(chapter.get("index", index))
-            title = str(chapter.get("title") or f"Section {chapter_index + 1}")
-            start = chapter_index * chunk_size
-            end = len(words) if index == section_count - 1 else min(len(words), (chapter_index + 1) * chunk_size)
-            chunk_text = " ".join(words[start:end]).strip() or " ".join(words[max(0, start - chunk_size):end]).strip()
-            if not chunk_text:
-                continue
-
-            sections.append(
-                {
-                    "index": chapter_index,
-                    "title": title,
-                    "text": chunk_text,
-                    "excerpt": chunk_text[:280],
-                    "start_seconds": float(chapter.get("start_seconds", chapter_index * 300.0)),
-                    "end_seconds": float(chapter.get("end_seconds", (chapter_index + 1) * 300.0)),
-                }
-            )
-
-        return sections
-
-    def get_queryset(self):
-        actor = self._resolve_actor(self.request)
-        return Document.objects.filter(user=actor, is_deleted=False).order_by("-created_at")
-
-    def destroy(self, request, *args, **kwargs):
-        document = self.get_object()
-        keep_history = str(request.query_params.get("keep_history", "true")).strip().lower() not in {
-            "false",
-            "0",
-            "no",
-            "off",
-        }
-
-        self._cleanup_document_files(document)
-
-        if keep_history:
-            document.source_file = None
-            document.audio_url = ""
-            document.audio_local_ref = ""
-            document.audio_duration_seconds = 0.0
-            document.is_deleted = True
-            document.deleted_at = timezone.now()
-            document.save(
-                update_fields=[
-                    "source_file",
-                    "audio_url",
-                    "audio_local_ref",
-                    "audio_duration_seconds",
-                    "is_deleted",
-                    "deleted_at",
-                    "updated_at",
-                ]
-            )
-            return Response(status=status.HTTP_204_NO_CONTENT)
-
-        document.delete()
-        return Response(status=status.HTTP_204_NO_CONTENT)
-
-    def get_permissions(self):
-        return [permissions.AllowAny()]
-
-    def perform_create(self, serializer):
-        actor = self._resolve_actor(self.request)
-        document = serializer.save(user=actor, status=Document.Status.UPLOADED)
-        extraction_job = self._create_extraction_job(document)
-
-        if document.source_file:
-            document.source_name = document.source_name or document.source_file.name.split("/")[-1]
-            document.source_mime_type = document.source_mime_type or getattr(document.source_file, "content_type", "")
-            document.source_size_bytes = document.source_size_bytes or int(getattr(document.source_file, "size", 0) or 0)
-            if not document.storage_mode:
-                document.storage_mode = "uploaded"
-            document.save(
-                update_fields=[
-                    "source_name",
-                    "source_mime_type",
-                    "source_size_bytes",
-                    "storage_mode",
-                    "updated_at",
-                ]
-            )
-
-        try:
-            extraction_job.status = ExtractionJob.Status.RUNNING
-            extraction_job.started_at = timezone.now()
-            extraction_job.save(update_fields=["status", "started_at", "updated_at"])
-
-            document.status = Document.Status.EXTRACTING
-            document.save(update_fields=["status", "updated_at"])
-
-            if document.source_file:
-                storage_key = document.source_file.path
-            else:
-                storage_key = document.source_name or document.title
-
-            extracted_text = extract_text_from_pdf(storage_key)
-            document.extracted_text = extracted_text
-            document.status = Document.Status.EXTRACTED
-            document.save(update_fields=["extracted_text", "status", "updated_at"])
-
-            extraction_job.text_preview = extracted_text[:500]
-            extraction_job.provider = "pypdf+ocr"
-            extraction_job.status = ExtractionJob.Status.SUCCEEDED
-            extraction_job.completed_at = timezone.now()
-            extraction_job.save(update_fields=["text_preview", "provider", "status", "completed_at", "updated_at"])
-        except Exception as error:
-            document.status = Document.Status.FAILED
-            document.save(update_fields=["status", "updated_at"])
-            extraction_job.status = ExtractionJob.Status.FAILED
-            extraction_job.error_message = str(error)[:2000] or "Extraction failed."
-            extraction_job.completed_at = timezone.now()
-            extraction_job.save(update_fields=["status", "error_message", "completed_at", "updated_at"])
-            return
-
-        if self._auto_detect_chapters_enabled() and document.extracted_text.strip():
-            try:
-                chapter_data = detect_chapters_ai(document.extracted_text)
-                document.chapter_map = chapter_data.get("chapters", [])
-                document.ai_summary = chapter_data.get("summary", "")
-                document.save(update_fields=["chapter_map", "ai_summary", "updated_at"])
-            except Exception:
-                # Chapter detection is best-effort and should not block upload/extraction completion.
-                pass
-
-        if self._auto_start_tts_enabled() and document.extracted_text.strip():
-            try:
-                self._run_tts_pipeline(document, voice=os.getenv("DEFAULT_TTS_VOICE", "en-US-Neural2-J"))
-            except Exception as error:
-                document.status = Document.Status.FAILED
-                document.save(update_fields=["status", "updated_at"])
-                latest_job = AudioJob.objects.filter(document=document).order_by("-created_at").first()
-                if latest_job:
-                    latest_job.status = AudioJob.Status.FAILED
-                    latest_job.error_message = str(error)[:2000] or "TTS processing failed."
-                    latest_job.completed_at = timezone.now()
-                    latest_job.save(update_fields=["status", "error_message", "completed_at", "updated_at"])
-
-    @action(detail=True, methods=["post"], url_path="start-tts")
-    def start_tts(self, request, pk=None):
-        document = self.get_object()
-
-        if not document.extracted_text.strip():
-            return Response(
-                {"detail": "Document must be extracted before TTS can start."},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
-
-        voice = request.data.get("voice", "en-US-Neural2-J")
-        try:
-            self._run_tts_pipeline(
-                document,
-                voice=voice,
-            )
-        except Exception as error:
-            document.status = Document.Status.FAILED
-            document.save(update_fields=["status", "updated_at"])
-            latest_job = AudioJob.objects.filter(document=document).order_by("-created_at").first()
-            if latest_job:
-                latest_job.status = AudioJob.Status.FAILED
-                latest_job.error_message = str(error)[:2000] or "TTS processing failed."
-                latest_job.completed_at = timezone.now()
-                latest_job.save(update_fields=["status", "error_message", "completed_at", "updated_at"])
-                return Response({"detail": latest_job.error_message}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
-            return Response({"detail": "TTS processing failed."}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
-
-        return Response(self.get_serializer(document).data, status=status.HTTP_200_OK)
-
-    @action(detail=False, methods=["get"], url_path="tts-voices")
-    def tts_voices(self, request):
-        voices = get_edge_voice_options()
-        default_voice = os.getenv("EDGE_TTS_VOICE", "en-US-AriaNeural")
-        return Response(
-            {
-                "provider": "edge-tts",
-                "default_voice": default_voice,
-                "voices": voices,
-            },
-            status=status.HTTP_200_OK,
-        )
-
-    @action(detail=True, methods=["get"], url_path="sections")
-    def sections(self, request, pk=None):
-        document = self.get_object()
-
-        if not document.extracted_text.strip():
-            return Response(
-                {"detail": "Document text is required before sections can be shown."},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
-
-        if not document.chapter_map:
-            detected = detect_chapters_ai(document.extracted_text)
-            document.chapter_map = detected.get("chapters", [])
-            document.ai_summary = detected.get("summary", "")
-            document.save(update_fields=["chapter_map", "ai_summary", "updated_at"])
-
-        sections = self._build_document_sections(document)
-        payload = {
-            "document_id": document.id,
-            "summary": document.ai_summary,
-            "sections": [
-                {
-                    "index": item["index"],
-                    "title": item["title"],
-                    "excerpt": item["excerpt"],
-                    "text": item["text"],
-                    "start_seconds": item["start_seconds"],
-                    "end_seconds": item["end_seconds"],
-                }
-                for item in sections
-            ],
-        }
-        return Response(payload, status=status.HTTP_200_OK)
-
-    @action(detail=True, methods=["post"], url_path="read-section")
-    def read_section(self, request, pk=None):
-        document = self.get_object()
-
-        if not document.extracted_text.strip():
-            return Response(
-                {"detail": "Document text is required before section reading can run."},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
-
-        try:
-            section_index = int(request.data.get("section_index"))
-        except (TypeError, ValueError):
-            return Response({"detail": "section_index is required and must be an integer."}, status=status.HTTP_400_BAD_REQUEST)
-
-        voice = str(request.data.get("voice") or os.getenv("EDGE_TTS_VOICE", "en-US-AriaNeural")).strip()
-        sections = self._build_document_sections(document)
-        selected = next((item for item in sections if int(item["index"]) == section_index), None)
-        if selected is None:
-            return Response({"detail": "Requested section was not found."}, status=status.HTTP_404_NOT_FOUND)
-
-        audio_job = self._create_audio_job(document, voice)
-        audio_job.status = AudioJob.Status.RUNNING
-        audio_job.started_at = timezone.now()
-        audio_job.save(update_fields=["status", "started_at", "updated_at"])
-
-        try:
-            tts_result = synthesize_speech(
-                selected["text"],
-                voice=voice,
-                preferred_provider="edge",
-            )
-            audio_url = build_public_audio_url(tts_result.audio_path)
-            audio_job.provider = tts_result.provider
-            audio_job.status = AudioJob.Status.SUCCEEDED
-            audio_job.audio_url = audio_url
-            audio_job.audio_local_ref = f"local://{Path(tts_result.audio_path).name}"
-            audio_job.audio_duration_seconds = round(max(1, len(selected["text"].split())) / 2.5, 2)
-            audio_job.completed_at = timezone.now()
-            audio_job.save(
-                update_fields=[
-                    "provider",
-                    "status",
-                    "audio_url",
-                    "audio_local_ref",
-                    "audio_duration_seconds",
-                    "completed_at",
-                    "updated_at",
-                ]
-            )
-        except Exception as error:
-            audio_job.status = AudioJob.Status.FAILED
-            audio_job.error_message = str(error)[:2000] or "Section TTS failed."
-            audio_job.completed_at = timezone.now()
-            audio_job.save(update_fields=["status", "error_message", "completed_at", "updated_at"])
-            return Response({"detail": audio_job.error_message}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
-
-        document.current_position_seconds = float(selected.get("start_seconds", 0.0))
-        document.save(update_fields=["current_position_seconds", "updated_at"])
-        self._record_navigation_event(
-            document,
-            ChapterNavigationEvent.EventType.PLAYBACK_SEEK,
-            {
-                "position_seconds": document.current_position_seconds,
-                "chapter_index": section_index,
-                "chapter_title": selected["title"],
-                "confidence": 1.0,
-                "provider": tts_result.provider,
-                "fallback_used": False,
-                "match_excerpt": selected["excerpt"],
-            },
-            payload={"event": "read-section", "voice": voice},
-        )
-
-        return Response(
-            {
-                "document_id": document.id,
-                "section_index": section_index,
-                "section_title": selected["title"],
-                "audio_url": audio_url,
-                "provider": tts_result.provider,
-                "voice": tts_result.voice,
-                "start_seconds": selected.get("start_seconds", 0.0),
-            },
-            status=status.HTTP_200_OK,
-        )
-
-    @action(detail=True, methods=["post"], url_path="detect-chapters")
-    def detect_chapters(self, request, pk=None):
-        document = self.get_object()
-        if not document.extracted_text.strip():
-            return Response(
-                {"detail": "Document must be extracted before chapter detection can run."},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
-
-        data = detect_chapters_ai(document.extracted_text)
-        document.chapter_map = data["chapters"]
-        document.ai_summary = data["summary"]
-        document.save(update_fields=["chapter_map", "ai_summary", "updated_at"])
-        payload = self.get_serializer(document).data
-        payload.update(
-            {
-                "provider": data.get("provider", "unknown"),
-                "fallback_used": data.get("fallback_used", False),
-                "latency_ms": data.get("latency_ms", 0.0),
-            }
-        )
-        self._record_navigation_event(
-            document,
-            ChapterNavigationEvent.EventType.DETECT_CHAPTERS,
-            {"position_seconds": document.current_position_seconds, "chapter_index": None, "chapter_title": ""},
-            payload={"latency_ms": data.get("latency_ms", 0.0), "chapters": len(data.get("chapters", []))},
-        )
-        return Response(payload, status=status.HTTP_200_OK)
-
-    @action(detail=True, methods=["post"], url_path="seek")
-    def seek(self, request, pk=None):
-        document = self.get_object()
-        if not document.chapter_map:
-            return Response(
-                {"detail": "No chapter map available. Run chapter detection first."},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
-
-        chapter_index = request.data.get("chapter_index")
-        seconds = request.data.get("seconds")
-
-        try:
-            chapter_index = None if chapter_index is None else int(chapter_index)
-            seconds = None if seconds is None else float(seconds)
-            result = seek_in_chapters(document.chapter_map, chapter_index, seconds)
-        except ValueError as error:
-            return Response({"detail": str(error)}, status=status.HTTP_400_BAD_REQUEST)
-
-        document.current_position_seconds = result["position_seconds"]
-        document.save(update_fields=["current_position_seconds", "updated_at"])
-        self._record_navigation_event(document, ChapterNavigationEvent.EventType.SEEK, result, payload={"chapter_index": chapter_index, "seconds": seconds})
-        payload = {
-            "document_id": document.id,
-            "position_seconds": result["position_seconds"],
-            "chapter_index": result["chapter_index"],
-            "chapter_title": result["chapter_title"],
-        }
-        return Response(payload, status=status.HTTP_200_OK)
-
-    @action(detail=True, methods=["post"], url_path="semantic-seek")
-    def semantic_seek(self, request, pk=None):
-        document = self.get_object()
-        query = str(request.data.get("query", "")).strip()
-
-        if not document.extracted_text.strip():
-            return Response({"detail": "Document text is required for semantic seek."}, status=status.HTTP_400_BAD_REQUEST)
-
-        if not document.chapter_map:
-            detected = detect_chapters_ai(document.extracted_text)
-            document.chapter_map = detected["chapters"]
-            document.ai_summary = detected["summary"]
-            document.save(update_fields=["chapter_map", "ai_summary", "updated_at"])
-
-        try:
-            result = semantic_seek_ai(document.extracted_text, document.chapter_map, query)
-        except ValueError as error:
-            return Response({"detail": str(error)}, status=status.HTTP_400_BAD_REQUEST)
-
-        document.current_position_seconds = result["position_seconds"]
-        document.save(update_fields=["current_position_seconds", "updated_at"])
-        self._record_navigation_event(
-            document,
-            ChapterNavigationEvent.EventType.SEMANTIC_SEEK,
-            result,
-            query=query,
-            payload={"query": query},
-        )
-        payload = {
-            "document_id": document.id,
-            "query": query,
-            "position_seconds": result["position_seconds"],
-            "chapter_index": result["chapter_index"],
-            "chapter_title": result["chapter_title"],
-            "confidence": result["confidence"],
-            "provider": result["provider"],
-            "fallback_used": result.get("fallback_used", False),
-            "latency_ms": result.get("latency_ms", 0.0),
-            "match_excerpt": result["match_excerpt"],
-        }
-        return Response(payload, status=status.HTTP_200_OK)
-
-    @action(detail=True, methods=["post"], url_path="playback-seek")
-    def playback_seek(self, request, pk=None):
-        document = self.get_object()
-        if not document.audio_url and not document.audio_local_ref:
-            return Response(
-                {"detail": "Audio is not available yet. Run TTS first."},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
-
-        chapter_index = request.data.get("chapter_index")
-        seconds = request.data.get("seconds")
-        query = str(request.data.get("query", "")).strip()
-
-        try:
-            if query:
-                if not document.chapter_map:
-                    detected = detect_chapters_ai(document.extracted_text)
-                    document.chapter_map = detected["chapters"]
-                    document.ai_summary = detected["summary"]
-                    document.save(update_fields=["chapter_map", "ai_summary", "updated_at"])
-                result = semantic_seek_ai(document.extracted_text, document.chapter_map, query)
-            else:
-                chapter_index = None if chapter_index is None else int(chapter_index)
-                seconds = None if seconds is None else float(seconds)
-                if document.chapter_map:
-                    result = seek_in_chapters(document.chapter_map, chapter_index, seconds)
-                    result.update(
-                        {
-                            "confidence": 1.0,
-                            "provider": "direct-seek",
-                            "fallback_used": False,
-                            "latency_ms": 0.0,
-                            "match_excerpt": "",
-                        }
-                    )
-                elif seconds is not None:
-                    result = {
-                        "position_seconds": max(0.0, seconds),
-                        "chapter_index": None,
-                        "chapter_title": None,
-                        "confidence": 1.0,
-                        "provider": "direct-seek",
-                        "fallback_used": False,
-                        "latency_ms": 0.0,
-                        "match_excerpt": "",
-                    }
-                else:
-                    return Response(
-                        {"detail": "No chapter map available. Run chapter detection first or provide seconds/query."},
-                        status=status.HTTP_400_BAD_REQUEST,
-                    )
-        except ValueError as error:
-            return Response({"detail": str(error)}, status=status.HTTP_400_BAD_REQUEST)
-
-        document.current_position_seconds = result["position_seconds"]
-        document.save(update_fields=["current_position_seconds", "updated_at"])
-        self._record_navigation_event(
-            document,
-            ChapterNavigationEvent.EventType.PLAYBACK_SEEK,
-            result,
-            query=query,
-            payload={"chapter_index": chapter_index, "seconds": seconds, "query": query},
-        )
-
-        payload = {
-            "document_id": document.id,
-            "audio_url": document.audio_url,
-            "audio_local_ref": document.audio_local_ref,
-            "target_offset_seconds": result["position_seconds"],
-            "chapter_index": result["chapter_index"],
-            "chapter_title": result["chapter_title"],
-            "confidence": result.get("confidence", 1.0),
-            "provider": result.get("provider", "direct-seek"),
-            "fallback_used": result.get("fallback_used", False),
-            "latency_ms": result.get("latency_ms", 0.0),
-            "match_excerpt": result.get("match_excerpt", ""),
-        }
-        return Response(payload, status=status.HTTP_200_OK)
-
-
-class ExtractionJobViewSet(viewsets.ReadOnlyModelViewSet):
-    serializer_class = ExtractionJobSerializer
-
-    def get_permissions(self):
-        return [permissions.AllowAny()]
-
-    def get_queryset(self):
-        actor = self.request.user
-        if settings.DEBUG and not actor.is_authenticated:
-            actor = get_user_model().objects.filter(username=os.getenv("DEV_GUEST_USERNAME", "guest")).first()
-        if not actor:
-            return ExtractionJob.objects.none()
-
-        queryset = ExtractionJob.objects.filter(user=actor).select_related("document")
-        document_id = self.request.query_params.get("document")
-        status_value = self.request.query_params.get("status")
-        if document_id:
-            queryset = queryset.filter(document_id=document_id)
-        if status_value:
-            queryset = queryset.filter(status=status_value)
-        return queryset
-
-
-class AudioJobViewSet(viewsets.ReadOnlyModelViewSet):
-    serializer_class = AudioJobSerializer
-
-    def get_permissions(self):
-        return [permissions.AllowAny()]
-
-    def get_queryset(self):
-        actor = self.request.user
-        if settings.DEBUG and not actor.is_authenticated:
-            actor = get_user_model().objects.filter(username=os.getenv("DEV_GUEST_USERNAME", "guest")).first()
-        if not actor:
-            return AudioJob.objects.none()
-
-        queryset = AudioJob.objects.filter(user=actor).select_related("document")
-        document_id = self.request.query_params.get("document")
-        status_value = self.request.query_params.get("status")
-        if document_id:
-            queryset = queryset.filter(document_id=document_id)
-        if status_value:
-            queryset = queryset.filter(status=status_value)
-        return queryset
-
-
-class ChapterNavigationEventViewSet(viewsets.ReadOnlyModelViewSet):
-    serializer_class = ChapterNavigationEventSerializer
-
-    def get_permissions(self):
-        return [permissions.AllowAny()]
-
-    def get_queryset(self):
-        actor = self.request.user
-        if settings.DEBUG and not actor.is_authenticated:
-            actor = get_user_model().objects.filter(username=os.getenv("DEV_GUEST_USERNAME", "guest")).first()
-        if not actor:
-            return ChapterNavigationEvent.objects.none()
-
-        queryset = ChapterNavigationEvent.objects.filter(user=actor).select_related("document")
-        document_id = self.request.query_params.get("document")
-        event_type = self.request.query_params.get("event_type")
-        if document_id:
-            queryset = queryset.filter(document_id=document_id)
-        if event_type:
-            queryset = queryset.filter(event_type=event_type)
-        return queryset
+            return JsonResponse({"detail": "text is required"}, status=400)
+            
+        response = StreamingHttpResponse(stream_edge_tts(text, voice), content_type="audio/mpeg")
+        response['Content-Disposition'] = 'inline; filename="stream.mp3"'
+        return response
+    except Exception as e:
+        return JsonResponse({"detail": str(e)}, status=500)
+
+@api_view(["GET"])
+@permission_classes([AllowAny])
+def voices_list(request):
+    return Response({"voices": get_edge_voice_options()})

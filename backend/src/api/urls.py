@@ -1,21 +1,21 @@
-from django.urls import include, path
-from rest_framework.routers import DefaultRouter
+from django.urls import path
 
 from .views import (
-    AudioJobViewSet,
-    ChapterNavigationEventViewSet,
-    DocumentViewSet,
-    ExtractionJobViewSet,
     health_check,
+    extract_document,
+    ai_sections,
+    tts_stream,
+    prepare_tts,
+    tts_stream_direct,
+    voices_list,
 )
-
-router = DefaultRouter()
-router.register("documents", DocumentViewSet, basename="document")
-router.register("extraction-jobs", ExtractionJobViewSet, basename="extraction-job")
-router.register("audio-jobs", AudioJobViewSet, basename="audio-job")
-router.register("navigation-events", ChapterNavigationEventViewSet, basename="navigation-event")
 
 urlpatterns = [
     path("health/", health_check, name="api-health"),
-    path("", include(router.urls)),
+    path("extract/", extract_document, name="api-extract"),
+    path("ai/sections/", ai_sections, name="api-sections"),
+    path("tts/", tts_stream, name="api-tts"),
+    path("tts_stream_direct/prepare/", prepare_tts, name="prepare_tts"),
+    path("tts_stream_direct/", tts_stream_direct, name="tts_stream_direct"),
+    path("voices/", voices_list, name="api-voices"),
 ]

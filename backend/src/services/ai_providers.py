@@ -23,13 +23,28 @@ def _extract_json_object(content: str) -> dict[str, Any]:
         raise AIProviderError("Failed to parse model JSON response.") from error
 
 
+DEFAULT_GROQ_MODEL = "openai/gpt-oss-120b"
+
+# Groq decommissions models periodically; transparently upgrade retired ids so a
+# stale GROQ_MODEL in .env doesn't silently break AI chaptering.
+_RETIRED_GROQ_MODELS = {
+    "llama-3.1-70b-versatile": DEFAULT_GROQ_MODEL,
+    "llama-3.3-70b-versatile": DEFAULT_GROQ_MODEL,
+    "llama3-70b-8192": DEFAULT_GROQ_MODEL,
+    "llama-3.1-405b-reasoning": DEFAULT_GROQ_MODEL,
+    "mixtral-8x7b-32768": DEFAULT_GROQ_MODEL,
+    "gemma-7b-it": DEFAULT_GROQ_MODEL,
+}
+
+
 def groq_chat_json(system_prompt: str, user_prompt: str, model: str | None = None) -> dict[str, Any]:
     api_key = os.getenv("GROQ_API_KEY", "").strip()
     if not api_key:
         raise AIProviderError("GROQ_API_KEY is not configured.")
 
     endpoint = os.getenv("GROQ_BASE_URL", "https://api.groq.com/openai/v1").rstrip("/")
-    chosen_model = model or os.getenv("GROQ_MODEL", "llama-3.1-70b-versatile")
+    chosen_model = (model or os.getenv("GROQ_MODEL", DEFAULT_GROQ_MODEL)).strip()
+    chosen_model = _RETIRED_GROQ_MODELS.get(chosen_model, chosen_model)
 
     payload = {
         "model": chosen_model,
@@ -62,7 +77,15 @@ def _to_float_vector(raw: Any) -> list[float]:
     if not isinstance(raw, list):
         raise AIProviderError("Embedding response format is invalid.")
 
+    # Some models return token-level embeddings ([[...], [...]]); mean-pool them
+    # into a single sentence vector.
     if raw and isinstance(raw[0], list):
+        columns = len(raw[0])
+        if columns and all(isinstance(row, list) and len(row) == columns for row in raw):
+            try:
+                return [sum(float(row[col]) for row in raw) / len(raw) for col in range(columns)]
+            except Exception as error:  # pragma: no cover - defensive parser
+                raise AIProviderError("Embedding response vector could not be parsed.") from error
         raw = raw[0]
 
     try:
@@ -82,18 +105,21 @@ def hf_embed(texts: list[str], model: str | None = None) -> list[list[float]]:
     chosen_model = model or os.getenv("HF_EMBEDDING_MODEL", "BAAI/bge-m3")
     endpoint = f"https://api-inference.huggingface.co/pipeline/feature-extraction/{chosen_model}"
     headers = {"Authorization": f"Bearer {token}"}
+    payload = {"inputs": [text[:8000] for text in texts], "options": {"wait_for_model": True}}
 
-    vectors: list[list[float]] = []
-    with httpx.Client(timeout=30.0) as client:
-        for text in texts:
-            response = client.post(endpoint, headers=headers, json={"inputs": text[:8000]})
-            if response.status_code >= 400:
-                raise AIProviderError(
-                    f"Hugging Face embedding request failed ({response.status_code}): {response.text[:300]}"
-                )
-            vectors.append(_to_float_vector(response.json()))
+    with httpx.Client(timeout=60.0) as client:
+        response = client.post(endpoint, headers=headers, json=payload)
 
-    return vectors
+    if response.status_code >= 400:
+        raise AIProviderError(
+            f"Hugging Face embedding request failed ({response.status_code}): {response.text[:300]}"
+        )
+
+    data = response.json()
+    if not isinstance(data, list) or len(data) != len(texts):
+        raise AIProviderError("Hugging Face embedding response shape did not match the request.")
+
+    return [_to_float_vector(item) for item in data]
 
 
 def cosine_similarity(vec_a: list[float], vec_b: list[float]) -> float:
